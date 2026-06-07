@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from bayes_factor_crowding.backtest.walkforward import run_walkforward_backtest
-from bayes_factor_crowding.inference.bayesian_student_t import BayesianStudentTRegimeInference
+from bayes_factor_crowding.inference.dummy import VolatilityHeuristicInference
 from bayes_factor_crowding.signals.risk_overlay import PosteriorRiskOverlay
 
 
@@ -29,7 +29,7 @@ def main() -> None:
     returns = make_synthetic_factor_returns()
     result = run_walkforward_backtest(
         factor_returns=returns,
-        engine=BayesianStudentTRegimeInference(),
+        engine=VolatilityHeuristicInference(),
         overlay=PosteriorRiskOverlay(),
         lookback_days=252,
     )

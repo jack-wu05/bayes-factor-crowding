@@ -14,17 +14,18 @@ factor returns
   -> walk-forward backtest
 ```
 
-The current code includes a first concrete Bayesian regime model:
+The current code includes an explicit mixed discrete-continuous model target for a sampler:
 
 ```text
-portfolio_return_t | z_t = regime
-  ~ Student-t(posterior predictive parameters for that regime)
-
-z_t | z_{t-1}
-  ~ sticky Markov transition matrix
+A_k ~ Dirichlet(alpha_k)
+z_1 ~ Categorical(pi_0)
+z_t | z_{t-1}, A ~ Categorical(A[z_{t-1}])
+sigma_k^2 ~ InverseGamma(a_0, b_0)
+mu_k | sigma_k^2 ~ Normal(m_0, sigma_k^2 / kappa_0)
+y_t | z_t = k, mu_k, sigma_k^2 ~ StudentT(nu, mu_k, sigma_k)
 ```
 
-The implemented engine is `BayesianStudentTRegimeInference`. It collapses factor returns into a portfolio return, estimates ordered normal/crowded/stress Student-t posterior predictives from the historical window, and runs an HMM filter to produce current regime probabilities.
+The implemented target is `models.student_t_regime.log_posterior`. It keeps the discrete path, transition matrix, regime means, and regime variances explicit so custom mixed discrete-continuous inference can sample them jointly.
 
 ## Layout
 
@@ -32,8 +33,8 @@ The implemented engine is `BayesianStudentTRegimeInference`. It collapses factor
 src/bayes_factor_crowding/
   data/        load and validate factor returns
   features/    build leakage-free model inputs
-  models/      latent-regime model configuration
-  inference/   Bayesian Student-t filter plus mixed-tempering adapter placeholder
+  models/      explicit latent-regime log posterior and configuration
+  inference/   stable interfaces plus mixed-tempering adapter placeholder
   signals/     convert posterior beliefs into risk multipliers
   backtest/    walk-forward loop, costs, metrics
   baselines/   simple comparison strategies
