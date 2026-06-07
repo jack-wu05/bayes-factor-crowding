@@ -27,6 +27,12 @@ y_t | z_t = k, mu_k, sigma_k^2 ~ StudentT(nu, mu_k, sigma_k)
 
 The implemented target is `models.student_t_regime.log_posterior`. It keeps the discrete path, transition matrix, regime means, and regime variances explicit so custom mixed discrete-continuous inference can sample them jointly.
 
+## Inference Methodology
+
+Inference is designed around a proprietary efficient mixed-tree variational parallel tempering algorithm. The method targets high-dimensional, multimodal, and strongly correlated mixed discrete-continuous posteriors, where the latent regime path is discrete and regime parameters are continuous.
+
+The public codebase exposes the model target and integration boundary, while the core sampler implementation is kept separate. Conceptually, the inference engine samples from the joint posterior over regime paths, transition probabilities, regime means, and regime variances, then reports posterior regime probabilities for downstream risk overlays.
+
 ## Layout
 
 ```text
