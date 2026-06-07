@@ -1,4 +1,4 @@
-"""Explicit Student-t latent-regime model target for mixed samplers."""
+"""Explicit multivariate Student-t latent-regime target for mixed samplers."""
 
 from __future__ import annotations
 
@@ -14,25 +14,85 @@ class StudentTRegimePriors:
 
     transition_alpha: np.ndarray
     initial_probabilities: np.ndarray
-    inverse_gamma_shape: float
-    inverse_gamma_scale: float
-    normal_mean: float
+    inverse_wishart_df: float
+    inverse_wishart_scale: np.ndarray
+    normal_mean: np.ndarray
     normal_kappa: float
     student_t_dof: float
+    enforce_covariance_ordering: bool = True
 
     @classmethod
-    def default(cls, n_regimes: int) -> "StudentTRegimePriors":
-        transition_alpha = np.full((n_regimes, n_regimes), 2.0)
-        np.fill_diagonal(transition_alpha, 20.0)
-        initial = np.ones(n_regimes) / n_regimes
+    def default(
+        cls,
+        n_regimes: int,
+        n_factors: int = 1,
+        covariance_prior_strength: float = 20.0,
+    ) -> "StudentTRegimePriors":
+        target_covariance = 1e-4 * np.eye(n_factors)
+        return cls.from_empirical_moments(
+            n_regimes=n_regimes,
+            mean=np.zeros(n_factors),
+            covariance=target_covariance,
+            covariance_prior_strength=covariance_prior_strength,
+        )
+
+    @classmethod
+    def from_observations(
+        cls,
+        observations: np.ndarray,
+        n_regimes: int,
+        covariance_prior_strength: float = 20.0,
+        transition_stickiness: float = 20.0,
+        transition_off_diagonal: float = 2.0,
+        normal_kappa: float = 5.0,
+        student_t_dof: float = 7.0,
+        enforce_covariance_ordering: bool = True,
+    ) -> "StudentTRegimePriors":
+        returns = _as_2d(observations)
+        mean = np.mean(returns, axis=0)
+        covariance = _regularized_covariance(returns, returns.shape[1])
+        return cls.from_empirical_moments(
+            n_regimes=n_regimes,
+            mean=mean,
+            covariance=covariance,
+            covariance_prior_strength=covariance_prior_strength,
+            transition_stickiness=transition_stickiness,
+            transition_off_diagonal=transition_off_diagonal,
+            normal_kappa=normal_kappa,
+            student_t_dof=student_t_dof,
+            enforce_covariance_ordering=enforce_covariance_ordering,
+        )
+
+    @classmethod
+    def from_empirical_moments(
+        cls,
+        n_regimes: int,
+        mean: np.ndarray,
+        covariance: np.ndarray,
+        covariance_prior_strength: float = 20.0,
+        transition_stickiness: float = 20.0,
+        transition_off_diagonal: float = 2.0,
+        normal_kappa: float = 5.0,
+        student_t_dof: float = 7.0,
+        enforce_covariance_ordering: bool = True,
+    ) -> "StudentTRegimePriors":
+        mean = np.asarray(mean, dtype=float)
+        covariance = np.asarray(covariance, dtype=float)
+        n_factors = len(mean)
+        transition_alpha = np.full((n_regimes, n_regimes), transition_off_diagonal)
+        np.fill_diagonal(transition_alpha, transition_stickiness)
+        initial = _default_initial_probabilities(n_regimes)
+        degrees_of_freedom = n_factors + 1.0 + covariance_prior_strength
+        scale = covariance * covariance_prior_strength
         return cls(
             transition_alpha=transition_alpha,
             initial_probabilities=initial,
-            inverse_gamma_shape=3.0,
-            inverse_gamma_scale=1e-4,
-            normal_mean=0.0,
-            normal_kappa=5.0,
-            student_t_dof=7.0,
+            inverse_wishart_df=degrees_of_freedom,
+            inverse_wishart_scale=scale,
+            normal_mean=mean,
+            normal_kappa=normal_kappa,
+            student_t_dof=student_t_dof,
+            enforce_covariance_ordering=enforce_covariance_ordering,
         )
 
 
@@ -43,7 +103,7 @@ class StudentTRegimeState:
     regimes: np.ndarray
     transition_matrix: np.ndarray
     means: np.ndarray
-    variances: np.ndarray
+    covariances: np.ndarray
 
 
 def log_posterior(
@@ -53,39 +113,49 @@ def log_posterior(
 ) -> float:
     """Evaluate the joint log posterior up to an additive constant.
 
-    # A_k ~ Dirichlet(α_k)
-    # z_1 ~ Categorical(π_0)
-    # z_t | z_{t-1}, A ~ Categorical(A[z_{t-1}])
-    # σ_k² ~ InverseGamma(a_0, b_0)
-    # μ_k | σ_k² ~ Normal(m_0, σ_k² / κ_0)
-    # y_t | z_t = k, μ_k, σ_k² ~ StudentT(ν, μ_k, σ_k)
+    # For k = 1, ..., K:
+    #   A_k ~ Dirichlet(α_k)
+    #   Σ_k ~ InverseWishart(ν_0, Ψ_0)
+    #   μ_k | Σ_k ~ MultivariateNormal(m_0, Σ_k / κ_0)
+    #
+    # Initial state:
+    #   z_1 ~ Categorical(π_0)
+    #
+    # For t = 2, ..., T:
+    #   z_t | z_{t-1}, A ~ Categorical(A[z_{t-1}])
+    #
+    # For t = 1, ..., T:
+    #   r_t | z_t = k, μ_k, Σ_k
+    #     ~ MultivariateStudentT(ν, μ_k, Σ_k)
+    #
+    # Constraint:
+    #   trace(Σ_1) <= trace(Σ_2) <= ... <= trace(Σ_K)
     """
 
-    y = np.asarray(observations, dtype=float)
-    z = np.asarray(state.regimes, dtype=int)
+    returns = _as_2d(observations)
+    regimes = np.asarray(state.regimes, dtype=int)
     transition = np.asarray(state.transition_matrix, dtype=float)
     means = np.asarray(state.means, dtype=float)
-    variances = np.asarray(state.variances, dtype=float)
+    covariances = np.asarray(state.covariances, dtype=float)
 
-    if not _state_is_valid(y, z, transition, means, variances, priors):
+    if not _state_is_valid(returns, regimes, transition, means, covariances, priors):
         return float("-inf")
 
     total = 0.0
     total += _log_transition_prior(transition, priors.transition_alpha)
-    total += _log_categorical(priors.initial_probabilities, z[0])
-    total += _log_regime_path(z, transition)
+    total += _log_categorical(priors.initial_probabilities, regimes[0])
+    total += _log_regime_path(regimes, transition)
 
-    for variance, mean in zip(variances, means):
-        total += _log_inverse_gamma(variance, priors.inverse_gamma_shape, priors.inverse_gamma_scale)
-        total += _log_normal(mean, priors.normal_mean, variance / priors.normal_kappa)
+    for mean, covariance in zip(means, covariances):
+        total += _log_inverse_wishart(covariance, priors.inverse_wishart_df, priors.inverse_wishart_scale)
+        total += _log_multivariate_normal(mean, priors.normal_mean, covariance / priors.normal_kappa)
 
-    sigma = np.sqrt(variances)
-    for observation, regime in zip(y, z):
-        total += _log_student_t(
+    for observation, regime in zip(returns, regimes):
+        total += _log_multivariate_student_t(
             observation,
             priors.student_t_dof,
             means[regime],
-            sigma[regime],
+            covariances[regime],
         )
 
     return float(total)
@@ -98,38 +168,58 @@ def make_initial_state(
 ) -> StudentTRegimeState:
     """Create a simple valid starting point for a sampler."""
 
-    y = np.asarray(observations, dtype=float)
-    if y.ndim != 1 or len(y) == 0:
-        raise ValueError("observations must be a non-empty one-dimensional array.")
+    returns = _as_2d(observations)
+    if len(returns) == 0:
+        raise ValueError("observations must be non-empty.")
     if n_regimes < 2:
         raise ValueError("n_regimes must be at least 2.")
     if not 0.0 < sticky_probability < 1.0:
         raise ValueError("sticky_probability must be between 0 and 1.")
 
-    centered_abs = np.abs(y - np.median(y))
+    n_factors = returns.shape[1]
+    centered_norm = np.linalg.norm(returns - np.median(returns, axis=0), axis=1)
     quantiles = np.linspace(0.0, 1.0, n_regimes + 1)[1:-1]
-    thresholds = np.quantile(centered_abs, quantiles)
-    regimes = np.searchsorted(thresholds, centered_abs, side="right")
+    thresholds = np.quantile(centered_norm, quantiles)
+    regimes = np.searchsorted(thresholds, centered_norm, side="right")
 
     off_diagonal = (1.0 - sticky_probability) / (n_regimes - 1)
     transition = np.full((n_regimes, n_regimes), off_diagonal)
     np.fill_diagonal(transition, sticky_probability)
 
-    global_mean = float(np.mean(y))
-    global_variance = max(float(np.var(y, ddof=1)), 1e-8) if len(y) > 1 else 1e-8
-    means = np.empty(n_regimes)
-    variances = np.empty(n_regimes)
+    global_mean = np.mean(returns, axis=0)
+    global_covariance = _regularized_covariance(returns, n_factors)
+    means = np.empty((n_regimes, n_factors))
+    covariances = np.empty((n_regimes, n_factors, n_factors))
     for regime in range(n_regimes):
-        group = y[regimes == regime]
-        means[regime] = float(np.mean(group)) if len(group) else global_mean
-        variances[regime] = max(float(np.var(group, ddof=1)), 1e-8) if len(group) > 1 else global_variance
+        group = returns[regimes == regime]
+        means[regime] = np.mean(group, axis=0) if len(group) else global_mean
+        covariances[regime] = _regularized_covariance(group, n_factors) if len(group) > 1 else global_covariance
 
     return StudentTRegimeState(
         regimes=regimes,
         transition_matrix=transition,
         means=means,
-        variances=variances,
+        covariances=covariances,
     )
+
+
+def _as_2d(observations: np.ndarray) -> np.ndarray:
+    returns = np.asarray(observations, dtype=float)
+    if returns.ndim == 1:
+        returns = returns[:, None]
+    if returns.ndim != 2:
+        raise ValueError("observations must be a one- or two-dimensional array.")
+    return returns
+
+
+def _regularized_covariance(values: np.ndarray, n_factors: int, jitter: float = 1e-8) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if len(values) <= 1:
+        return jitter * np.eye(n_factors)
+    covariance = np.cov(values, rowvar=False)
+    if covariance.ndim == 0:
+        covariance = np.array([[float(covariance)]])
+    return covariance + jitter * np.eye(n_factors)
 
 
 def _state_is_valid(
@@ -137,36 +227,68 @@ def _state_is_valid(
     regimes: np.ndarray,
     transition: np.ndarray,
     means: np.ndarray,
-    variances: np.ndarray,
+    covariances: np.ndarray,
     priors: StudentTRegimePriors,
 ) -> bool:
+    n_observations, n_factors = observations.shape
     n_regimes = len(means)
-    if observations.ndim != 1 or regimes.ndim != 1:
-        return False
-    if len(observations) != len(regimes) or len(observations) == 0:
+    if regimes.ndim != 1 or len(regimes) != n_observations or n_observations == 0:
         return False
     if transition.shape != (n_regimes, n_regimes):
+        return False
+    if means.shape != (n_regimes, n_factors):
+        return False
+    if covariances.shape != (n_regimes, n_factors, n_factors):
         return False
     if priors.transition_alpha.shape != transition.shape:
         return False
     if len(priors.initial_probabilities) != n_regimes:
         return False
-    if len(variances) != n_regimes:
+    if priors.normal_mean.shape != (n_factors,):
+        return False
+    if priors.inverse_wishart_scale.shape != (n_factors, n_factors):
         return False
     if np.any(regimes < 0) or np.any(regimes >= n_regimes):
         return False
-    if np.any(transition <= 0.0) or np.any(variances <= 0.0):
+    if np.any(transition <= 0.0):
         return False
     if np.any(priors.transition_alpha <= 0.0) or np.any(priors.initial_probabilities <= 0.0):
         return False
-    if priors.inverse_gamma_shape <= 0.0 or priors.inverse_gamma_scale <= 0.0:
+    if priors.inverse_wishart_df <= n_factors - 1:
         return False
     if priors.normal_kappa <= 0.0 or priors.student_t_dof <= 0.0:
         return False
-    return bool(
-        np.allclose(transition.sum(axis=1), 1.0)
-        and np.isclose(priors.initial_probabilities.sum(), 1.0)
-    )
+    if not np.allclose(transition.sum(axis=1), 1.0):
+        return False
+    if not np.isclose(priors.initial_probabilities.sum(), 1.0):
+        return False
+    if not _is_positive_definite(priors.inverse_wishart_scale):
+        return False
+    if priors.enforce_covariance_ordering and not _covariances_are_ordered(covariances):
+        return False
+    return all(_is_positive_definite(covariance) for covariance in covariances)
+
+
+def _is_positive_definite(matrix: np.ndarray) -> bool:
+    try:
+        np.linalg.cholesky(matrix)
+    except np.linalg.LinAlgError:
+        return False
+    return True
+
+
+def _covariances_are_ordered(covariances: np.ndarray) -> bool:
+    traces = np.array([np.trace(covariance) for covariance in covariances])
+    return bool(np.all(np.diff(traces) >= -1e-12))
+
+
+def _default_initial_probabilities(n_regimes: int) -> np.ndarray:
+    if n_regimes == 3:
+        return np.array([0.80, 0.15, 0.05])
+    if n_regimes == 2:
+        return np.array([0.90, 0.10])
+    weights = np.linspace(n_regimes, 1, n_regimes, dtype=float)
+    return weights / weights.sum()
 
 
 def _log_transition_prior(transition: np.ndarray, alpha: np.ndarray) -> float:
@@ -191,16 +313,54 @@ def _log_categorical(probabilities: np.ndarray, category: int) -> float:
     return float(log(float(probabilities[category])))
 
 
-def _log_inverse_gamma(value: float, shape: float, scale: float) -> float:
-    return shape * log(scale) - lgamma(shape) - (shape + 1.0) * log(value) - scale / value
+def _log_inverse_wishart(covariance: np.ndarray, degrees_of_freedom: float, scale: np.ndarray) -> float:
+    dimension = covariance.shape[0]
+    scale_logdet = _logdet_positive_definite(scale)
+    covariance_logdet = _logdet_positive_definite(covariance)
+    precision_trace = float(np.trace(scale @ np.linalg.inv(covariance)))
+    return (
+        0.5 * degrees_of_freedom * scale_logdet
+        - 0.5 * degrees_of_freedom * dimension * log(2.0)
+        - _log_multivariate_gamma(0.5 * degrees_of_freedom, dimension)
+        - 0.5 * (degrees_of_freedom + dimension + 1.0) * covariance_logdet
+        - 0.5 * precision_trace
+    )
 
 
-def _log_normal(value: float, mean: float, variance: float) -> float:
-    return -0.5 * (log(2.0 * pi * variance) + ((value - mean) ** 2) / variance)
+def _log_multivariate_normal(value: np.ndarray, mean: np.ndarray, covariance: np.ndarray) -> float:
+    dimension = len(value)
+    diff = value - mean
+    solve = np.linalg.solve(covariance, diff)
+    return -0.5 * (
+        dimension * log(2.0 * pi)
+        + _logdet_positive_definite(covariance)
+        + float(diff @ solve)
+    )
 
 
-def _log_student_t(value: float, dof: float, location: float, scale: float) -> float:
-    standardized = (value - location) / scale
-    normalizer = lgamma((dof + 1.0) / 2.0) - lgamma(dof / 2.0) - log(scale) - 0.5 * log(dof * pi)
-    kernel = -((dof + 1.0) / 2.0) * log(1.0 + (standardized**2) / dof)
-    return normalizer + kernel
+def _log_multivariate_student_t(value: np.ndarray, dof: float, location: np.ndarray, scale: np.ndarray) -> float:
+    dimension = len(value)
+    diff = value - location
+    solve = np.linalg.solve(scale, diff)
+    quadratic = float(diff @ solve)
+    return (
+        lgamma((dof + dimension) / 2.0)
+        - lgamma(dof / 2.0)
+        - 0.5 * dimension * log(dof * pi)
+        - 0.5 * _logdet_positive_definite(scale)
+        - 0.5 * (dof + dimension) * log(1.0 + quadratic / dof)
+    )
+
+
+def _log_multivariate_gamma(value: float, dimension: int) -> float:
+    return (
+        dimension * (dimension - 1.0) * log(pi) / 4.0
+        + sum(lgamma(value + (1.0 - i) / 2.0) for i in range(1, dimension + 1))
+    )
+
+
+def _logdet_positive_definite(matrix: np.ndarray) -> float:
+    sign, logdet = np.linalg.slogdet(matrix)
+    if sign <= 0:
+        return float("nan")
+    return float(logdet)
