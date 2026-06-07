@@ -8,3 +8,7 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Local/private sampler implementation. Keep this out of the public repo.
+src/bayes_factor_crowding/samplers/
+tests/test_gaussian_tree_sampler.py
