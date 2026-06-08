@@ -55,6 +55,17 @@ Inference is designed around a proprietary efficient mixed-tree variational para
 
 The public codebase exposes the model target and integration boundary, while the core sampler implementation is kept separate. Conceptually, the inference engine samples from the joint posterior over regime paths, transition probabilities, regime mean vectors, and regime covariance matrices, then reports posterior regime probabilities for downstream risk overlays.
 
+## Market Context Summaries
+
+The `context` module includes optional OpenAI API boilerplate for explaining posterior regime moves with timestamp-valid macro, market, and news context. The summarizer filters out documents published after the as-of date, then calls the OpenAI Responses API to produce a concise explanation of the regime shift.
+
+Install the optional LLM dependency and set an API key before using it:
+
+```bash
+python -m pip install -e ".[llm]"
+export OPENAI_API_KEY="..."
+```
+
 ## Layout
 
 ```text
